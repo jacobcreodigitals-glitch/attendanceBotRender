@@ -10,6 +10,10 @@ const PORT = process.env.PORT || 3000
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json())
 
+// ============================================================
+// GOOGLE AUTHENTICATION
+// ============================================================
+
 let auth
 
 if (process.env.GOOGLE_SERVICE_ACCOUNT) {
@@ -29,9 +33,23 @@ const sheets = google.sheets({
   auth,
 })
 
+// ============================================================
+// CONFIG
+// ============================================================
+
 const SPREADSHEET_ID = "1bw1K7vC5MPsE65YVu64B-vIKnR4t8PeVovjIN25sFiA"
 
+const ATTENDANCE_RANGE = "Sheet1!A:F"
+const RATES_RANGE = "Rates!A:C"
 const PHILIPPINE_TIMEZONE = "Asia/Manila"
+
+// Prevent two identical clock-in requests from being processed
+// at the exact same time on this server instance.
+const pendingClockIns = new Set()
+
+// ============================================================
+// DATE / TIME HELPERS
+// ============================================================
 
 function getPhilippineDateTime() {
   const now = new Date()
@@ -74,20 +92,94 @@ function formatAttendanceTime(time) {
   return `${hours}:${minutes} ${period}`
 }
 
+// ============================================================
+// GOOGLE SHEETS HELPERS
+// ============================================================
+
+async function getAttendanceRows() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: ATTENDANCE_RANGE,
+  })
+
+  return response.data.values || []
+}
+
+async function getRatesRows() {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: RATES_RANGE,
+  })
+
+  return response.data.values || []
+}
+
+// Find a user's attendance record for a specific date.
+function findAttendanceRecord(rows, date, userId) {
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i]
+
+    const rowDate = row[0]
+    const rowUserId = row[2]
+
+    if (rowDate === date && rowUserId === userId) {
+      return {
+        row,
+        rowNumber: i + 1,
+      }
+    }
+  }
+
+  return null
+}
+
+// ============================================================
+// SLACK TABLE HELPERS
+// ============================================================
+
+// Creates a consistently aligned Slack code-block table.
+function createSlackTable(headers, rows, widths) {
+  const formatCell = (value, width) => {
+    const text = String(value ?? "-")
+
+    // Prevent long values from breaking the table.
+    return text.slice(0, width).padEnd(width, " ")
+  }
+
+  const header = headers
+    .map((header, index) => formatCell(header, widths[index]))
+    .join(" | ")
+
+  const separator = widths.map((width) => "-".repeat(width)).join("-+-")
+
+  const body = rows
+    .map((row) =>
+      row.map((value, index) => formatCell(value, widths[index])).join(" | "),
+    )
+    .join("\n")
+
+  return ["```", header, separator, body, "```"].join("\n")
+}
+
+// ============================================================
+// BASIC ROUTES
+// ============================================================
+
 app.get("/", (req, res) => {
   res.send("Attendance Bot is running!")
 })
 
+// ============================================================
+// TEST GOOGLE SHEETS
+// ============================================================
+
 app.get("/test-sheets", async (req, res) => {
   try {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: "Sheet1!A1:F10",
-    })
+    const rows = await getAttendanceRows()
 
-    console.log(response.data.values)
+    console.log(rows)
 
-    res.json(response.data.values)
+    res.json(rows)
   } catch (error) {
     console.error(error)
 
@@ -95,38 +187,43 @@ app.get("/test-sheets", async (req, res) => {
   }
 })
 
+// ============================================================
+// CLOCK IN
+// ============================================================
+
 app.post("/slack/clockin", async (req, res) => {
+  const userName = req.body.user_name
+  const userId = req.body.user_id
+
+  if (!userName || !userId) {
+    return res.status(400).send("Missing Slack user information.")
+  }
+
+  const { date, time } = getPhilippineDateTime()
+
+  const lockKey = `${date}:${userId}`
+
+  // Prevent simultaneous duplicate requests.
+  if (pendingClockIns.has(lockKey)) {
+    return res.send("Your clock-in is already being processed.")
+  }
+
+  pendingClockIns.add(lockKey)
+
   try {
-    const userName = req.body.user_name
-    const userId = req.body.user_id
+    const rows = await getAttendanceRows()
 
-    const { date, time } = getPhilippineDateTime()
+    // Check whether the user already clocked in today.
+    const existingRecord = findAttendanceRecord(rows, date, userId)
 
-    // Get existing attendance records
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: "Sheet1!A:F",
-    })
-
-    const rows = response.data.values || []
-
-    // Check if this user already clocked in today
-    const alreadyClockedIn = rows.some((row) => {
-      const rowDate = row[0]
-      const rowUserId = row[2]
-
-      return rowDate === date && rowUserId === userId
-    })
-
-    // Stop if already clocked in
-    if (alreadyClockedIn) {
+    if (existingRecord) {
       return res.send("You have already clocked in today.")
     }
 
-    // Add new attendance record
+    // Create exactly one attendance record.
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
-      range: "Sheet1!A:F",
+      range: ATTENDANCE_RANGE,
       valueInputOption: "USER_ENTERED",
       requestBody: {
         values: [[date, userName, userId, time, "", ""]],
@@ -135,72 +232,65 @@ app.post("/slack/clockin", async (req, res) => {
 
     res.send(`Clocked in successfully at ${time}`)
   } catch (error) {
-    console.error(error)
+    console.error("Clock-in error:", error)
 
     res.status(500).send("There was an error clocking in.")
+  } finally {
+    pendingClockIns.delete(lockKey)
   }
 })
+
+// ============================================================
+// CLOCK OUT
+// ============================================================
 
 app.post("/slack/clockout", async (req, res) => {
   try {
     const userId = req.body.user_id
 
-    const { date, time } = getPhilippineDateTime()
-
-    // Get attendance records
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: "Sheet1!A:F",
-    })
-
-    const rows = response.data.values || []
-
-    // Find today's attendance row for this user
-    let rowNumber = null
-    let existingClockOut = false
-    let clockIn = null
-
-    for (let i = 0; i < rows.length; i++) {
-      const rowDate = rows[i][0]
-      const rowUserId = rows[i][2]
-      const rowClockIn = rows[i][3]
-      const rowClockOut = rows[i][4]
-
-      if (rowDate === date && rowUserId === userId) {
-        rowNumber = i + 1
-        clockIn = rowClockIn
-        existingClockOut = rowClockOut
-        break
-      }
+    if (!userId) {
+      return res.status(400).send("Missing Slack user ID.")
     }
 
-    // User has not clocked in
-    if (rowNumber === null) {
+    const { date, time } = getPhilippineDateTime()
+
+    const rows = await getAttendanceRows()
+
+    const record = findAttendanceRecord(rows, date, userId)
+
+    // User has not clocked in.
+    if (!record) {
       return res.send(
         "You cannot clock out because you have not clocked in today.",
       )
     }
 
-    // User already clocked out
+    const clockIn = record.row[3]
+    const existingClockOut = record.row[4]
+
+    // User already clocked out.
     if (existingClockOut) {
       return res.send("You have already clocked out today.")
     }
 
-    // Convert clock-in and clock-out times into Date objects
+    if (!clockIn) {
+      return res.send("Your clock-in time could not be found.")
+    }
+
+    // Convert times into Date objects.
     const clockInDate = new Date(`${date} ${clockIn}`)
     const clockOutDate = new Date(`${date} ${time}`)
 
-    // Calculate hours worked
-    const millisecondsWorked = clockOutDate - clockInDate
+    const millisecondsWorked = clockOutDate.getTime() - clockInDate.getTime()
+
     const hoursWorked = millisecondsWorked / (1000 * 60 * 60)
 
-    // Round to 2 decimal places
-    const hours = hoursWorked.toFixed(2)
+    const hours = Math.max(0, hoursWorked).toFixed(2)
 
-    // Update Clock Out and Hours columns
+    // Update Clock Out + Hours.
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
-      range: `Sheet1!E${rowNumber}:F${rowNumber}`,
+      range: `Sheet1!E${record.rowNumber}:F${record.rowNumber}`,
       valueInputOption: "USER_ENTERED",
       requestBody: {
         values: [[time, hours]],
@@ -209,105 +299,98 @@ app.post("/slack/clockout", async (req, res) => {
 
     res.send(`Clocked out successfully at ${time}. Hours worked: ${hours}`)
   } catch (error) {
-    console.error(error)
+    console.error("Clock-out error:", error)
 
     res.status(500).send("There was an error clocking out.")
   }
 })
 
+// ============================================================
+// ATTENDANCE
+// ============================================================
+
 app.post("/slack/attendance", async (req, res) => {
   try {
     const { date } = getPhilippineDateTime()
 
-    // Get attendance records
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: "Sheet1!A:F",
-    })
+    const rows = await getAttendanceRows()
 
-    const rows = response.data.values || []
+    // Only today's records.
+    const todayRows = rows.filter((row, index) => {
+      if (index === 0) {
+        return false
+      }
 
-    // Get only today's attendance
-    const todayRows = rows.filter((row) => {
       return row[0] === date
     })
 
-    // No attendance yet
     if (todayRows.length === 0) {
       return res.send(`No attendance records for ${date}.`)
     }
 
-    // Build attendance table
-    let message = `📋 Attendance for ${date}\n\n`
-
-    message += "```"
-    message += "Name          | In       | Out      | Hours\n"
-    message += "--------------|----------|----------|------\n"
-
-    todayRows.forEach((row) => {
+    const tableRows = todayRows.map((row) => {
       const userName = row[1] || "-"
-      const clockIn = row[3] || "-"
-      const clockOut = row[4] || "-"
+      const clockIn = formatAttendanceTime(row[3])
+      const clockOut = formatAttendanceTime(row[4])
       const hours = row[5] || "-"
 
-      // Shorten times from 11:17:09 AM → 11:17 AM
-      const formattedClockIn = formatAttendanceTime(clockIn)
-      const formattedClockOut = formatAttendanceTime(clockOut)
-
-      // Keep the name column aligned
-      const formattedName = userName.padEnd(13, " ").slice(0, 13)
-
-      const formattedIn = formattedClockIn.padEnd(9, " ").slice(0, 9)
-      const formattedOut = formattedClockOut.padEnd(9, " ").slice(0, 9)
-
-      message += `${formattedName}| ${formattedIn}| ${formattedOut}| ${hours}\n`
+      return [userName, clockIn, clockOut, hours]
     })
 
-    message += "```"
+    const table = createSlackTable(
+      ["Name", "In", "Out", "Hours"],
+      tableRows,
+      [16, 10, 10, 7],
+    )
+
+    const message = `📋 Attendance for ${date}\n\n${table}`
 
     res.send(message)
   } catch (error) {
-    console.error(error)
+    console.error("Attendance error:", error)
 
     res.status(500).send("There was an error getting attendance.")
   }
 })
 
+// ============================================================
+// INVOICE
+// ============================================================
+
 app.post("/slack/invoice", async (req, res) => {
   try {
     const { date } = getPhilippineDateTime()
 
-    // Get today's date
-    const today = new Date()
+    // ----------------------------------------------------------
+    // Calculate 15-day invoice period.
+    // ----------------------------------------------------------
 
-    // Get date 14 days before today
-    // This gives us 15 calendar days including today
-    const startDate = new Date(today)
-    startDate.setDate(today.getDate() - 14)
+    const now = new Date()
 
-    // Read attendance records
-    const attendanceResponse = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: "Sheet1!A:F",
-    })
+    const startDate = new Date(now)
+    startDate.setDate(now.getDate() - 14)
 
-    const attendanceRows = attendanceResponse.data.values || []
+    // ----------------------------------------------------------
+    // Get attendance + rates.
+    // ----------------------------------------------------------
 
-    // Read employee rates
-    const ratesResponse = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: "Rates!A:C",
-    })
+    const [attendanceRows, ratesRows] = await Promise.all([
+      getAttendanceRows(),
+      getRatesRows(),
+    ])
 
-    const ratesRows = ratesResponse.data.values || []
+    // ----------------------------------------------------------
+    // Build rate lookup.
+    // ----------------------------------------------------------
 
-    // Create a rate lookup using Slack ID
     const rates = {}
 
     for (let i = 1; i < ratesRows.length; i++) {
-      const userName = ratesRows[i][0]
-      const slackId = ratesRows[i][1]
-      const hourlyRate = parseFloat(ratesRows[i][2])
+      const row = ratesRows[i]
+
+      const userName = row[0]
+      const slackId = row[1]
+      const hourlyRate = parseFloat(row[2])
 
       if (slackId && !isNaN(hourlyRate)) {
         rates[slackId] = {
@@ -317,10 +400,12 @@ app.post("/slack/invoice", async (req, res) => {
       }
     }
 
-    // Store invoice totals by Slack ID
+    // ----------------------------------------------------------
+    // Aggregate attendance by Slack ID.
+    // ----------------------------------------------------------
+
     const invoiceData = {}
 
-    // Process attendance records
     for (let i = 1; i < attendanceRows.length; i++) {
       const row = attendanceRows[i]
 
@@ -329,38 +414,41 @@ app.post("/slack/invoice", async (req, res) => {
       const slackId = row[2]
       const hours = parseFloat(row[5])
 
-      // Skip incomplete records
+      // Only completed attendance records.
       if (!rowDate || !slackId || isNaN(hours)) {
         continue
       }
 
-      // Convert sheet date into a Date object
       const attendanceDate = new Date(rowDate)
 
-      // Skip invalid dates
       if (isNaN(attendanceDate.getTime())) {
         continue
       }
 
-      // Check if attendance is inside the 15-day period
-      if (attendanceDate < startDate || attendanceDate > today) {
+      // Only records inside invoice period.
+      if (attendanceDate < startDate || attendanceDate > now) {
         continue
       }
 
-      // Create user entry if it doesn't exist
+      // Create user once.
       if (!invoiceData[slackId]) {
         invoiceData[slackId] = {
-          userName: userName,
+          userName,
           hours: 0,
         }
       }
 
-      // Add hours
+      // Add hours to the existing user.
       invoiceData[slackId].hours += hours
     }
 
-    // No completed hours
-    if (Object.keys(invoiceData).length === 0) {
+    // ----------------------------------------------------------
+    // No completed records.
+    // ----------------------------------------------------------
+
+    const employees = Object.values(invoiceData)
+
+    if (employees.length === 0) {
       return res.send(
         `No completed attendance records from ${startDate.toLocaleDateString(
           "en-US",
@@ -368,27 +456,20 @@ app.post("/slack/invoice", async (req, res) => {
       )
     }
 
-    // Build invoice message
-    let message = `🧾 Invoice\n`
-    message += `Period: ${startDate.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-    })} - ${date}\n\n`
-
-    message += "```"
-    message += "Name          | Hours    | Rate     | Amount\n"
-    message += "--------------|----------|----------|----------\n"
+    // ----------------------------------------------------------
+    // Build invoice table.
+    // ----------------------------------------------------------
 
     let totalHours = 0
     let totalAmount = 0
 
-    Object.keys(invoiceData).forEach((slackId) => {
-      const employee = invoiceData[slackId]
+    const tableRows = []
 
+    for (const [slackId, employee] of Object.entries(invoiceData)) {
       const hours = employee.hours
+
       const rateInfo = rates[slackId]
 
-      // Use rate from Rates sheet
       const rate = rateInfo ? rateInfo.hourlyRate : 0
 
       const amount = hours * rate
@@ -396,32 +477,51 @@ app.post("/slack/invoice", async (req, res) => {
       totalHours += hours
       totalAmount += amount
 
-      const name = employee.userName.padEnd(13, " ").slice(0, 13)
+      tableRows.push([
+        employee.userName,
+        hours.toFixed(2),
+        rate.toFixed(2),
+        amount.toFixed(2),
+      ])
+    }
 
-      const formattedHours = hours.toFixed(2).padStart(8, " ")
-      const formattedRate = rate.toFixed(2).padStart(8, " ")
-      const formattedAmount = amount.toFixed(2).padStart(8, " ")
+    // Add total row.
+    tableRows.push(["Total", totalHours.toFixed(2), "", totalAmount.toFixed(2)])
 
-      message += `${name}|${formattedHours} |${formattedRate} |${formattedAmount}\n`
+    const table = createSlackTable(
+      ["Name", "Hours", "Rate", "Amount"],
+      tableRows,
+      [16, 8, 10, 10],
+    )
+
+    // ----------------------------------------------------------
+    // Final Slack message.
+    // ----------------------------------------------------------
+
+    const periodStart = startDate.toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
     })
 
-    message += "--------------|----------|----------|----------\n"
+    const periodEnd = new Date(now).toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+    })
 
-    message += `Total         |${totalHours
-      .toFixed(2)
-      .padStart(8, " ")} |          |${totalAmount
-      .toFixed(2)
-      .padStart(8, " ")}\n`
-
-    message += "```"
+    const message =
+      `🧾 Invoice\n` + `Period: ${periodStart} - ${periodEnd}\n\n` + table
 
     res.send(message)
   } catch (error) {
-    console.error(error)
+    console.error("Invoice error:", error)
 
     res.status(500).send("There was an error generating the invoice.")
   }
 })
+
+// ============================================================
+// START SERVER
+// ============================================================
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
