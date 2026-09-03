@@ -194,6 +194,7 @@ app.get("/test-sheets", async (req, res) => {
 app.post("/slack/clockin", async (req, res) => {
   const userName = req.body.user_name
   const userId = req.body.user_id
+  const responseUrl = req.body.response_url
 
   if (!userName || !userId) {
     return res.status(400).send("Missing Slack user information.")
@@ -210,31 +211,65 @@ app.post("/slack/clockin", async (req, res) => {
 
   pendingClockIns.add(lockKey)
 
+  // Acknowledge Slack immediately.
+  res.send("Clock-in request received. Processing...")
+
   try {
     const rows = await getAttendanceRows()
 
     // Check whether the user already clocked in today.
     const existingRecord = findAttendanceRecord(rows, date, userId)
 
+    let message
+
     if (existingRecord) {
-      return res.send("You have already clocked in today.")
+      message = "You have already clocked in today."
+    } else {
+      // Create exactly one attendance record.
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: ATTENDANCE_RANGE,
+        valueInputOption: "USER_ENTERED",
+        requestBody: {
+          values: [[date, userName, userId, time, "", ""]],
+        },
+      })
+
+      message = `Clocked in successfully at ${time}`
     }
 
-    // Create exactly one attendance record.
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: ATTENDANCE_RANGE,
-      valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [[date, userName, userId, time, "", ""]],
-      },
-    })
-
-    res.send(`Clocked in successfully at ${time}`)
+    // Send the final result back to Slack.
+    if (responseUrl) {
+      await fetch(responseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          response_type: "ephemeral",
+          text: message,
+        }),
+      })
+    }
   } catch (error) {
     console.error("Clock-in error:", error)
 
-    res.status(500).send("There was an error clocking in.")
+    if (responseUrl) {
+      try {
+        await fetch(responseUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            response_type: "ephemeral",
+            text: "There was an error clocking in.",
+          }),
+        })
+      } catch (slackError) {
+        console.error("Slack response error:", slackError)
+      }
+    }
   } finally {
     pendingClockIns.delete(lockKey)
   }
@@ -245,63 +280,106 @@ app.post("/slack/clockin", async (req, res) => {
 // ============================================================
 
 app.post("/slack/clockout", async (req, res) => {
+  const userId = req.body.user_id
+  const responseUrl = req.body.response_url
+
+  if (!userId) {
+    return res.status(400).send("Missing Slack user ID.")
+  }
+
+  // Acknowledge Slack immediately.
+  res.send("Clock-out request received. Processing...")
+
   try {
-    const userId = req.body.user_id
-
-    if (!userId) {
-      return res.status(400).send("Missing Slack user ID.")
-    }
-
     const { date, time } = getPhilippineDateTime()
 
     const rows = await getAttendanceRows()
 
     const record = findAttendanceRecord(rows, date, userId)
 
+    let message
+
     // User has not clocked in.
     if (!record) {
-      return res.send(
-        "You cannot clock out because you have not clocked in today.",
-      )
+      message = "You cannot clock out because you have not clocked in today."
+    } else {
+      const clockIn = record.row[3]
+      const existingClockOut = record.row[4]
+
+      // User already clocked out.
+      if (existingClockOut) {
+        message = "You have already clocked out today."
+      } else if (!clockIn) {
+        message = "Your clock-in time could not be found."
+      } else {
+        // Convert times into Date objects.
+        const clockInDate = new Date(`${date} ${clockIn}`)
+        const clockOutDate = new Date(`${date} ${time}`)
+
+        let millisecondsWorked = clockOutDate.getTime() - clockInDate.getTime()
+
+        // Lunch break: 12:00 PM - 1:00 PM.
+        const lunchStart = new Date(`${date} 12:00 PM`)
+        const lunchEnd = new Date(`${date} 1:00 PM`)
+
+        // Deduct 1 hour only when the work period overlaps the lunch break.
+        const overlapsLunch =
+          clockInDate < lunchEnd && clockOutDate > lunchStart
+
+        if (overlapsLunch) {
+          millisecondsWorked -= 60 * 60 * 1000
+        }
+
+        const hoursWorked = millisecondsWorked / (1000 * 60 * 60)
+
+        const hours = Math.max(0, hoursWorked).toFixed(2)
+
+        // Update Clock Out + Hours.
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `Sheet1!E${record.rowNumber}:F${record.rowNumber}`,
+          valueInputOption: "USER_ENTERED",
+          requestBody: {
+            values: [[time, hours]],
+          },
+        })
+
+        message = `Clocked out successfully at ${time}. Hours worked: ${hours}`
+      }
     }
 
-    const clockIn = record.row[3]
-    const existingClockOut = record.row[4]
-
-    // User already clocked out.
-    if (existingClockOut) {
-      return res.send("You have already clocked out today.")
+    // Send the final result back to Slack.
+    if (responseUrl) {
+      await fetch(responseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          response_type: "ephemeral",
+          text: message,
+        }),
+      })
     }
-
-    if (!clockIn) {
-      return res.send("Your clock-in time could not be found.")
-    }
-
-    // Convert times into Date objects.
-    const clockInDate = new Date(`${date} ${clockIn}`)
-    const clockOutDate = new Date(`${date} ${time}`)
-
-    const millisecondsWorked = clockOutDate.getTime() - clockInDate.getTime()
-
-    const hoursWorked = millisecondsWorked / (1000 * 60 * 60)
-
-    const hours = Math.max(0, hoursWorked).toFixed(2)
-
-    // Update Clock Out + Hours.
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `Sheet1!E${record.rowNumber}:F${record.rowNumber}`,
-      valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [[time, hours]],
-      },
-    })
-
-    res.send(`Clocked out successfully at ${time}. Hours worked: ${hours}`)
   } catch (error) {
     console.error("Clock-out error:", error)
 
-    res.status(500).send("There was an error clocking out.")
+    if (responseUrl) {
+      try {
+        await fetch(responseUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            response_type: "ephemeral",
+            text: "There was an error clocking out.",
+          }),
+        })
+      } catch (slackError) {
+        console.error("Slack response error:", slackError)
+      }
+    }
   }
 })
 
@@ -310,6 +388,11 @@ app.post("/slack/clockout", async (req, res) => {
 // ============================================================
 
 app.post("/slack/attendance", async (req, res) => {
+  const responseUrl = req.body.response_url
+
+  // Acknowledge Slack immediately.
+  res.send("Attendance request received. Processing...")
+
   try {
     const { date } = getPhilippineDateTime()
 
@@ -324,32 +407,61 @@ app.post("/slack/attendance", async (req, res) => {
       return row[0] === date
     })
 
+    let message
+
     if (todayRows.length === 0) {
-      return res.send(`No attendance records for ${date}.`)
+      message = `No attendance records for ${date}.`
+    } else {
+      const tableRows = todayRows.map((row) => {
+        const userName = row[1] || "-"
+        const clockIn = formatAttendanceTime(row[3])
+        const clockOut = formatAttendanceTime(row[4])
+        const hours = row[5] || "-"
+
+        return [userName, clockIn, clockOut, hours]
+      })
+
+      const table = createSlackTable(
+        ["Name", "In", "Out", "Hours"],
+        tableRows,
+        [16, 10, 10, 7],
+      )
+
+      message = `📋 Attendance for ${date}\n\n${table}`
     }
 
-    const tableRows = todayRows.map((row) => {
-      const userName = row[1] || "-"
-      const clockIn = formatAttendanceTime(row[3])
-      const clockOut = formatAttendanceTime(row[4])
-      const hours = row[5] || "-"
-
-      return [userName, clockIn, clockOut, hours]
-    })
-
-    const table = createSlackTable(
-      ["Name", "In", "Out", "Hours"],
-      tableRows,
-      [16, 10, 10, 7],
-    )
-
-    const message = `📋 Attendance for ${date}\n\n${table}`
-
-    res.send(message)
+    // Send the final result back to Slack.
+    if (responseUrl) {
+      await fetch(responseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          response_type: "in_channel",
+          text: message,
+        }),
+      })
+    }
   } catch (error) {
     console.error("Attendance error:", error)
 
-    res.status(500).send("There was an error getting attendance.")
+    if (responseUrl) {
+      try {
+        await fetch(responseUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            response_type: "ephemeral",
+            text: "There was an error getting attendance.",
+          }),
+        })
+      } catch (slackError) {
+        console.error("Slack response error:", slackError)
+      }
+    }
   }
 })
 
@@ -358,6 +470,11 @@ app.post("/slack/attendance", async (req, res) => {
 // ============================================================
 
 app.post("/slack/invoice", async (req, res) => {
+  const responseUrl = req.body.response_url
+
+  // Acknowledge Slack immediately.
+  res.send("Invoice request received. Processing...")
+
   try {
     const { date } = getPhilippineDateTime()
 
@@ -448,74 +565,106 @@ app.post("/slack/invoice", async (req, res) => {
 
     const employees = Object.values(invoiceData)
 
+    let message
+
     if (employees.length === 0) {
-      return res.send(
-        `No completed attendance records from ${startDate.toLocaleDateString(
-          "en-US",
-        )} to ${date}.`,
-      )
-    }
+      message = `No completed attendance records from ${startDate.toLocaleDateString(
+        "en-US",
+      )} to ${date}.`
+    } else {
+      // ----------------------------------------------------------
+      // Build invoice table.
+      // ----------------------------------------------------------
 
-    // ----------------------------------------------------------
-    // Build invoice table.
-    // ----------------------------------------------------------
+      let totalHours = 0
+      let totalAmount = 0
 
-    let totalHours = 0
-    let totalAmount = 0
+      const tableRows = []
 
-    const tableRows = []
+      for (const [slackId, employee] of Object.entries(invoiceData)) {
+        const hours = employee.hours
 
-    for (const [slackId, employee] of Object.entries(invoiceData)) {
-      const hours = employee.hours
+        const rateInfo = rates[slackId]
 
-      const rateInfo = rates[slackId]
+        const rate = rateInfo ? rateInfo.hourlyRate : 0
 
-      const rate = rateInfo ? rateInfo.hourlyRate : 0
+        const amount = hours * rate
 
-      const amount = hours * rate
+        totalHours += hours
+        totalAmount += amount
 
-      totalHours += hours
-      totalAmount += amount
+        tableRows.push([
+          employee.userName,
+          hours.toFixed(2),
+          rate.toFixed(2),
+          amount.toFixed(2),
+        ])
+      }
 
+      // Add total row.
       tableRows.push([
-        employee.userName,
-        hours.toFixed(2),
-        rate.toFixed(2),
-        amount.toFixed(2),
+        "Total",
+        totalHours.toFixed(2),
+        "",
+        totalAmount.toFixed(2),
       ])
+
+      const table = createSlackTable(
+        ["Name", "Hours", "Rate", "Amount"],
+        tableRows,
+        [16, 8, 10, 10],
+      )
+
+      // ----------------------------------------------------------
+      // Final Slack message.
+      // ----------------------------------------------------------
+
+      const periodStart = startDate.toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+      })
+
+      const periodEnd = new Date(now).toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+      })
+
+      message =
+        `🧾 Invoice\n` + `Period: ${periodStart} - ${periodEnd}\n\n` + table
     }
 
-    // Add total row.
-    tableRows.push(["Total", totalHours.toFixed(2), "", totalAmount.toFixed(2)])
-
-    const table = createSlackTable(
-      ["Name", "Hours", "Rate", "Amount"],
-      tableRows,
-      [16, 8, 10, 10],
-    )
-
-    // ----------------------------------------------------------
-    // Final Slack message.
-    // ----------------------------------------------------------
-
-    const periodStart = startDate.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-    })
-
-    const periodEnd = new Date(now).toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-    })
-
-    const message =
-      `🧾 Invoice\n` + `Period: ${periodStart} - ${periodEnd}\n\n` + table
-
-    res.send(message)
+    // Send the final result back to Slack.
+    if (responseUrl) {
+      await fetch(responseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          response_type: "ephemeral",
+          text: message,
+        }),
+      })
+    }
   } catch (error) {
     console.error("Invoice error:", error)
 
-    res.status(500).send("There was an error generating the invoice.")
+    if (responseUrl) {
+      try {
+        await fetch(responseUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            response_type: "ephemeral",
+            text: "There was an error generating the invoice.",
+          }),
+        })
+      } catch (slackError) {
+        console.error("Slack response error:", slackError)
+      }
+    }
   }
 })
 
